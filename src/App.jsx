@@ -299,4 +299,707 @@ export default function SpotibeApp() {
   const scrubberRef = useRef(null);
 
   const showError = useCallback((msg,ms=3500)=>{
-    if(!mountedRef.current) return
+    if(!mountedRef.current) return;
+    setApiError(msg); setTimeout(()=>{ if(mountedRef.current) setApiError(""); },ms);
+  },[]);
+  const handleRateLimit = useCallback((secs)=>{
+    if(!mountedRef.current) return;
+    clearInterval(rateLimitTimerRef.current);
+    setRateLimitSecs(secs);
+    rateLimitTimerRef.current=setInterval(()=>{
+      setRateLimitSecs(s=>{
+        if(s<=1){ clearInterval(rateLimitTimerRef.current); return 0; }
+        return s-1;
+      });
+    },1000);
+  },[]);
+  const spotifyCall = useSpotify(tokenRef, handleRateLimit);
+
+  // ── loadSpotifyData ────────────────────────────────────────────
+  function loadSpotifyData() {
+    if(!mountedRef.current||!tokenRef.current) return;
+    if(loadCancelRef.current) loadCancelRef.current.cancelled=true;
+    const ctx={cancelled:false};
+    loadCancelRef.current=ctx;
+    loadStateRef.current="loading";
+    setIsLoading(true);
+    (async()=>{
+      try {
+        const [me,top,recent,pls,saved]=await Promise.allSettled([
+          spotifyCall("/me"),
+          spotifyCall("/me/top/tracks?limit=10&time_range=short_term"),
+          spotifyCall("/me/player/recently-played?limit=10"),
+          spotifyCall("/me/playlists?limit=10"),
+          spotifyCall("/me/tracks?limit=20"),
+        ]);
+        if(ctx.cancelled||!mountedRef.current) return;
+        const v=r=>r.status==="fulfilled"?r.value:null;
+        const all=[me,top,recent,pls,saved].map(v);
+        if(all.some(r=>r?.__status===401)){
+          loadStateRef.current="blocked";
+          runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));
+          return;
+        }
+        if(v(me))            setUser(v(me));
+        if(v(top)?.items)    setTopTracks(v(top).items.map(enrich));
+        if(v(recent)?.items) setRecentTracks(v(recent).items.map(i=>enrich(i.track)));
+        if(v(pls)?.items)    setPlaylists(v(pls).items.filter(Boolean));
+        if(v(saved)?.items){
+          const tracks=v(saved).items.map(i=>i.track).filter(Boolean);
+          setLikedTracks(tracks);
+          setLiked(Object.fromEntries(tracks.map(t=>[t.id,true])));
+        }
+        const pb=await spotifyCall("/me/player");
+        if(ctx.cancelled||!mountedRef.current) return;
+        if(pb?.__status===401){ loadStateRef.current="blocked"; runRefreshRef.current?.(sessionStorage.getItem("sp_refresh")); return; }
+        if(pb?.item){ setCurrentTrack(enrich(pb.item)); setIsPlaying(pb.is_playing); setProgressMs(pb.progress_ms||0); setShuffle(pb.shuffle_state); setRepeat(pb.repeat_state!=="off"); }
+        const q=await spotifyCall("/me/player/queue");
+        if(ctx.cancelled||!mountedRef.current) return;
+        if(q?.queue) setQueue(q.queue.slice(0,15).map(enrich));
+        loadStateRef.current="done";
+      } catch { showError("Failed to load Spotify data — check your connection."); loadStateRef.current="idle"; }
+      finally  { if(!ctx.cancelled&&mountedRef.current) setIsLoading(false); }
+    })();
+  }
+  loadFnRef.current=loadSpotifyData;
+
+  // ── applyTokens ────────────────────────────────────────────────
+  function applyTokens(access,refresh,expiresIn) {
+    if(!mountedRef.current) return;
+    const expiry=Date.now()+expiresIn*1000;
+    tokenRef.current=access;
+    setToken(access); setIsDemo(false);
+    if(refreshCountRef.current>0){
+      if(--refreshCountRef.current<=0){ refreshCountRef.current=0; setIsRefreshing(false); }
+    }
+    sessionStorage.setItem("sp_token",access);
+    sessionStorage.setItem("sp_expiry",String(expiry));
+    if(refresh!=null) sessionStorage.setItem("sp_refresh",refresh);
+    clearTimeout(refreshTimerRef.current);
+    const remaining=expiry-Date.now()-60_000;
+    const rt=refresh??sessionStorage.getItem("sp_refresh");
+    if(rt){
+      if(remaining>0){
+        refreshTimerRef.current=setTimeout(()=>{ if(mountedRef.current) runRefreshRef.current?.(rt); },remaining);
+      } else {
+        runRefreshRef.current?.(rt);
+      }
+    }
+  }
+  applyTokensRef.current=applyTokens;
+
+  // ── runRefresh — FIX #4: uses counter ref ─────────────────────
+  async function runRefresh(rt) {
+    if(!rt||!mountedRef.current) return;
+    refreshCountRef.current++;
+    if(mountedRef.current) setIsRefreshing(true);
+    try {
+      const d=await callRefresh(rt);
+      if(d?.access_token){
+        applyTokensRef.current(d.access_token,d.refresh_token??null,d.expires_in);
+        if(loadStateRef.current==="blocked"){
+          loadStateRef.current="idle";
+          loadFnRef.current?.();
+        }
+      } else {
+        refreshCountRef.current=Math.max(0,refreshCountRef.current-1); if(refreshCountRef.current===0&&mountedRef.current) setIsRefreshing(false);
+        clearSP();
+        if(mountedRef.current){
+          tokenRef.current=""; setToken(""); setIsDemo(true);
+          setUser(null); setDeviceId(null);
+          setAuthError("Session expired — please reconnect Spotify.");
+        }
+      }
+    } catch {
+      refreshCountRef.current=Math.max(0,refreshCountRef.current-1);
+      if(refreshCountRef.current===0&&mountedRef.current) setIsRefreshing(false);
+      if(mountedRef.current) showError("Could not refresh session.");
+    }
+  }
+  runRefreshRef.current=runRefresh;
+
+  // ── OAuth callback ─────────────────────────────────────────────
+  useEffect(()=>{
+    if(typeof window==="undefined") return;
+    const p=new URLSearchParams(window.location.search);
+    const code=p.get("code"),err=p.get("error");
+    if(err){
+      const errMsg={access_denied:"Permission denied — please try again and allow access",invalid_scope:"Invalid scope requested",invalid_client:"Invalid client configuration"}[err]||err;
+      setAuthError(`Spotify login error: ${errMsg}`); return;
+    }
+    if(!code) return;
+    exchangeCode(code)
+      .then(d=>{
+        if(d?.access_token){
+          window.history.replaceState({},"",window.location.pathname);
+          sessionStorage.removeItem("sp_verifier");
+          applyTokensRef.current(d.access_token,d.refresh_token,d.expires_in);
+        } else {
+          setAuthError(d?.error_description||d?.error||"Auth code exchange failed — please try again.");
+        }
+      })
+      .catch(()=>setAuthError("Network error during auth — please try again."));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  // ── Mount: schedule refresh ────────────────────────────────────
+  useEffect(()=>{
+    const stored=sessionStorage.getItem("sp_token");
+    const rt    =sessionStorage.getItem("sp_refresh");
+    const expiry=Number(sessionStorage.getItem("sp_expiry"))||0;
+    if(!stored||!rt) return;
+    if(refreshTimerRef.current) return;
+    tokenRef.current=stored;
+    const remaining=expiry-Date.now()-60_000;
+    if(remaining>0){
+      refreshTimerRef.current=setTimeout(()=>runRefreshRef.current?.(rt),remaining);
+    } else {
+      loadStateRef.current="blocked";
+      runRefreshRef.current?.(rt);
+    }
+    return ()=>clearTimeout(refreshTimerRef.current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  // ── Data-load effect ───────────────────────────────────────────
+  useEffect(()=>{
+    if(!token||isDemo) return;
+    if(loadStateRef.current!=="idle") return;
+    loadFnRef.current?.();
+  },[isDemo,token]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── SDK ────────────────────────────────────────────────────────
+  useEffect(()=>{
+    if(!token||isDemo||sdkInitialized.current) return;
+    sdkInitialized.current=true;
+    const script=document.createElement("script");
+    script.src="https://sdk.scdn.co/spotify-player.js"; script.async=true;
+    document.body.appendChild(script);
+    window.onSpotifyWebPlaybackSDKReady=()=>{
+      const player=new window.Spotify.Player({
+        name:"Spotibe",
+        getOAuthToken:cb=>cb(tokenRef.current),
+        volume:0.7,
+      });
+      playerRef.current=player;
+      player.addListener("ready",({device_id})=>{ if(mountedRef.current) setDeviceId(device_id); });
+      player.addListener("not_ready",()=>{ if(mountedRef.current) setDeviceId(null); });
+      player.addListener("player_state_changed",state=>{
+        if(!state||!mountedRef.current) return;
+        const track=state.track_window?.current_track;
+        if(track) setCurrentTrack(enrich(track));
+        setIsPlaying(!state.paused);
+        if(!state.paused) setPlaybackConfirmed(true);
+        const latency=state.timestamp?Math.min(Date.now()-state.timestamp,2000):0;
+        setProgressMs(state.position+(state.paused?0:latency));
+      });
+      player.connect();
+    };
+    return ()=>{
+      playerRef.current?.disconnect(); playerRef.current=null;
+      sdkInitialized.current=false;
+      try{ document.body.removeChild(script); } catch{}
+    };
+  },[token,isDemo]);
+
+  // ── Progress ticker ────────────────────────────────────────────
+  useEffect(()=>{
+    clearInterval(tickRef.current);
+    if(isPlaying&&!deviceId){
+      tickRef.current=setInterval(()=>{
+        setProgressMs(p=>{ if(p>=durRef.current){setIsPlaying(false);return 0;} return p+1000; });
+      },1000);
+    }
+    return ()=>clearInterval(tickRef.current);
+  },[isPlaying,deviceId]); // currentTrack intentionally omitted — durRef handles duration
+
+  // ── Lyric sync ─────────────────────────────────────────────────
+  useEffect(()=>{
+    const s=progressMs/1000; let idx=0;
+    for(let i=0;i<LYRICS.length;i++) if(LYRICS[i].time<=s) idx=i;
+    setLyricIdx(idx);
+  },[progressMs]);
+  useEffect(()=>{
+    if(screen!=="lyrics") return;
+    lyricsRef.current?.children[lyricIdx]?.scrollIntoView({behavior:"smooth",block:"center"});
+  },[lyricIdx,screen]);
+
+  // ── Search ──────────────────────────────────────────────────────
+  useEffect(()=>{
+    if(!searchQuery){ setSearchRes([]); setIsSearching(false); return; }
+    if(isDemo){ setSearchRes(DEMO.filter(t=>tN(t).toLowerCase().includes(searchQuery.toLowerCase())||tA(t).toLowerCase().includes(searchQuery.toLowerCase()))); return; }
+    const tid=setTimeout(async()=>{
+      if(!mountedRef.current) return;
+      setIsSearching(true);
+      const d=await spotifyCall(`/search?q=${encodeURIComponent(searchQuery)}&type=track&limit=12`);
+      if(!mountedRef.current) return;
+      if(d?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));
+      setIsSearching(false);
+      setSearchRes(d?.tracks?.items?.map(enrich)||[]);
+    },380);
+    return ()=>{ clearTimeout(tid); if(mountedRef.current) setIsSearching(false); };
+  },[searchQuery,isDemo,spotifyCall]);
+
+  // ── Playback API helpers ────────────────────────────────────────
+  const devQ=()=>deviceId?`?device_id=${deviceId}`:"";
+  const apiPlay=async(uri)=>{
+    if(isDemo) return true;
+    if(!isRealUri(uri)) return false;
+    const r=await spotifyCall(`/me/player/play${devQ()}`,"PUT",{uris:[uri]});
+    if(r?.__status===401){ runRefreshRef.current?.(sessionStorage.getItem("sp_refresh")); return false; }
+    return r!==null;
+  };
+  const apiResume=async()=>{
+    if(isDemo) return true;
+    const r=await spotifyCall(`/me/player/play${devQ()}`,"PUT");
+    if(r?.__status===401){ runRefreshRef.current?.(sessionStorage.getItem("sp_refresh")); return false; }
+    return r!==null;
+  };
+  const apiPause=async()=>{
+    if(!isDemo){const r=await spotifyCall("/me/player/pause","PUT");
+      if(r?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));
+    }
+  };
+  const apiNext=async()=>{
+    if(!isDemo){const r=await spotifyCall("/me/player/next","POST");
+      if(r?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));
+    }
+  };
+  const apiPrev=async()=>{
+    if(!isDemo){const r=await spotifyCall("/me/player/previous","POST");
+      if(r?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));
+    }
+  };
+
+  const togglePlay=async()=>{
+    if(isPlaying){ setIsPlaying(false); await apiPause(); }
+    else{
+      setIsPlaying(true);
+      const ok=await apiResume();
+      if(!ok&&mountedRef.current){ setIsPlaying(false); showError("No active device — open Spotify on any device first."); }
+    }
+  };
+  const handlePlayTrack=async(track)=>{
+    setCurrentTrack(track); setProgressMs(0); setIsPlaying(true);
+    setPlaybackConfirmed(false);
+    goTo("player");
+    const ok=await apiPlay(track.uri);
+    if(mountedRef.current){
+      setPlaybackConfirmed(true);
+      if(!ok){ setIsPlaying(false); showError("Playback failed — make sure Spotify is open on a device."); }
+    }
+    if(!isDemo){ const q=await spotifyCall("/me/player/queue"); if(mountedRef.current&&q?.queue) setQueue(q.queue.slice(0,15).map(enrich)); }
+    else setQueue(DEMO.filter(t=>t.id!==track.id));
+  };
+
+  const handleNext=async()=>{
+    if(skipInFlight.current) return;
+    skipInFlight.current=true; setSkipDirection("next");
+    await apiNext();
+    if(!isDemo){ await delay(600); const pb=await spotifyCall("/me/player"); if(mountedRef.current&&pb?.item){ setCurrentTrack(enrich(pb.item)); setProgressMs(pb.progress_ms||0); } }
+    else{ const idx=DEMO.findIndex(t=>t.id===currentTrackRef.current.id); setCurrentTrack(DEMO[(idx+1)%DEMO.length]); setProgressMs(0); }
+    if(mountedRef.current){ setSkipDirection(null); skipInFlight.current=false; }
+  };
+  const handlePrev=async()=>{
+    if(skipInFlight.current) return;
+    skipInFlight.current=true; setSkipDirection("prev");
+    await apiPrev();
+    if(!isDemo){ await delay(600); const pb=await spotifyCall("/me/player"); if(mountedRef.current&&pb?.item){ setCurrentTrack(enrich(pb.item)); setProgressMs(pb.progress_ms||0); } }
+    else{ const idx=DEMO.findIndex(t=>t.id===currentTrackRef.current.id); setCurrentTrack(DEMO[(idx-1+DEMO.length)%DEMO.length]); setProgressMs(0); }
+    if(mountedRef.current){ setSkipDirection(null); skipInFlight.current=false; }
+  };
+
+  const toggleLike=async(id,e)=>{
+    e?.stopPropagation();
+    const next=!liked[id]; setLiked(p=>({...p,[id]:next}));
+    if(!isDemo){ const r=await spotifyCall(`/me/tracks?ids=${id}`,next?"PUT":"DELETE");
+    if((!r||r?.__status===401)&&mountedRef.current){ setLiked(p=>({...p,[id]:!next})); showError("Could not update saved tracks."); if(r?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh")); } }
+  };
+  const seekTo=async(pct)=>{
+    const dur=durRef.current;
+    if(!dur) return;
+    const ms=Math.round(Math.max(0,Math.min(1,pct))*dur);
+    setIsSeeking(true); setProgressMs(ms);
+    if(!isDemo){const r=await spotifyCall(`/me/player/seek?position_ms=${ms}`,"PUT"); if(r?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));}
+    setTimeout(()=>{ if(mountedRef.current) setIsSeeking(false); },100);
+  };
+  const handleSeek        =e=>{ const r=e.currentTarget.getBoundingClientRect(); seekTo((e.clientX-r.left)/r.width); };
+  const handleScrubberSeek=e=>{ const r=scrubberRef.current?.getBoundingClientRect(); if(r) seekTo((e.clientX-r.left)/r.width); };
+  const handleSeekKey=e=>{
+    const dur=durRef.current;
+    if(!dur) return;
+    const step=dur*0.02;
+    if(e.key==="ArrowRight"||e.key==="ArrowUp")  seekTo((progressMs+step)/dur);
+    if(e.key==="ArrowLeft" ||e.key==="ArrowDown") seekTo((progressMs-step)/dur);
+  };
+  const handleVolumeKey=e=>{
+    let v=volRef.current;
+    if(e.key==="ArrowRight"||e.key==="ArrowUp")  v=Math.min(100,v+5);
+    if(e.key==="ArrowLeft" ||e.key==="ArrowDown") v=Math.max(0,v-5);
+    if(v!==volRef.current){
+      setVolume(v); volRef.current=v;
+      if(!isDemo){
+        clearTimeout(volumeDebounceRef.current);
+        volumeDebounceRef.current=setTimeout(async()=>{
+          const res=await spotifyCall(`/me/player/volume?volume_percent=${v}`,"PUT");
+          if(res?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));
+        },300);
+      }
+    }
+  };
+  const handleVolume=async e=>{
+    const r=e.currentTarget.getBoundingClientRect();
+    const v=Math.max(0,Math.min(100,Math.round(((e.clientX-r.left)/r.width)*100)));
+    setVolume(v); volRef.current=v;
+    if(!isDemo){const res=await spotifyCall(`/me/player/volume?volume_percent=${v}`,"PUT");
+      if(res?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));
+    }
+  };
+
+  const toggleShuffle=async()=>{ const n=!shuffle; setShuffle(n); if(!isDemo){const r=await spotifyCall(`/me/player/shuffle?state=${n}`,"PUT"); if(r?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));} };
+  const toggleRepeat=async()=>{ const n=!repeat; setRepeat(n); if(!isDemo){const r=await spotifyCall(`/me/player/repeat?state=${n?"track":"off"}`,"PUT"); if(r?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));} };
+
+  const handleLyricSeek=async line=>{
+    const prev=progressMs,ms=line.time*1000; setProgressMs(ms);
+    if(!isDemo){
+      try{
+        const r=await spotifyCall(`/me/player/seek?position_ms=${ms}`,"PUT");
+        if(r?.__status===401) runRefreshRef.current?.(sessionStorage.getItem("sp_refresh"));
+      }catch{ if(mountedRef.current){ setProgressMs(prev); showError("Seek failed."); } }
+    }
+  };
+
+  const removeFromQueue=idx=>{ setQueue(q=>q.filter((_,i)=>i!==idx)); setQueueNote(true); setTimeout(()=>{ if(mountedRef.current) setQueueNote(false); },3500); };
+
+  const handleDisconnect=()=>{
+    clearTimeout(refreshTimerRef.current);
+    clearSP(); tokenRef.current="";
+    setToken(""); setIsDemo(true); setUser(null);
+    setDeviceId(null); setIsRefreshing(false);
+    refreshCountRef.current=0;
+    loadStateRef.current="idle";
+    setPlaybackConfirmed(true);
+    playerRef.current?.disconnect();
+  };
+
+  // ── Derived ─────────────────────────────────────────────────────
+  const accent        = tAc(currentTrack);
+  const cover         = tC(currentTrack);
+  const pct           = Math.max(0,Math.min(100,(progressMs/(tD(currentTrack)||1))*100));
+  const barTransition = isSeeking?"none":"width .8s linear";
+  const seekValueText = `${fms(progressMs)} of ${fms(tD(currentTrack))}`;
+
+  // ═══════════════════════════════════════════════════════════════
+  return (
+    <div style={{fontFamily:"'Outfit',sans-serif",background:"#060608",minHeight:"100vh",display:"flex",justifyContent:"center",alignItems:"center",padding:20}}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::-webkit-scrollbar{width:0}
+        .tr:hover{background:rgba(255,255,255,0.06)!important}
+        .cb:hover{transform:scale(1.12)}
+        .ch:hover{transform:translateY(-3px)}
+        input::placeholder{color:rgba(255,255,255,0.28)}
+        input:focus{outline:none}
+        [role=button]:focus-visible,[role=slider]:focus-visible{outline:2px solid rgba(255,255,255,0.45);outline-offset:2px;border-radius:6px}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes pulse{0%,100%{transform:scaleY(0.3)}50%{transform:scaleY(1)}}
+        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+        @keyframes shimmer{0%,100%{opacity:.5}50%{opacity:1}}
+        @keyframes slideIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+        .screen{animation:fadeUp .28s ease}
+        .b1{animation:pulse .75s ease-in-out infinite}
+        .b2{animation:pulse .75s ease-in-out .15s infinite}
+        .b3{animation:pulse .75s ease-in-out .3s infinite}
+        .lyric{transition:all .4s ease}
+        .lyric:hover{color:rgba(255,255,255,.65)!important}
+        .lyric-on{color:#fff!important;font-size:21px!important;font-weight:800!important}
+        .toast{animation:slideIn .25s ease}
+      `}</style>
+
+      <div style={{width:393,height:852,background:"#0d0d10",borderRadius:50,overflow:"hidden",position:"relative",
+        boxShadow:`0 0 0 1px rgba(255,255,255,0.07),0 40px 100px rgba(0,0,0,0.9),0 0 80px ${accent}18`,
+        display:"flex",flexDirection:"column",transition:"box-shadow 1s ease"}}>
+        <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:0,background:`radial-gradient(ellipse 70% 35% at 50% 0%, ${accent}12 0%, transparent 65%)`,transition:"background 1.2s ease"}}/>
+
+        {/* Status bar */}
+        <div style={{padding:"14px 28px 6px",display:"flex",justifyContent:"space-between",alignItems:"center",color:"rgba(255,255,255,0.5)",fontSize:13,fontWeight:500,position:"relative",zIndex:10,flexShrink:0}}>
+          <span>9:41</span>
+          <div style={{width:120,height:28,background:"#000",borderRadius:18,position:"absolute",left:"50%",transform:"translateX(-50%)"}}/>
+          <span style={{fontSize:11,letterSpacing:1}}>●●●</span>
+        </div>
+
+        <div style={{flex:1,overflowY:"auto",position:"relative",zIndex:1}}>
+
+          {/* ── Banners ── */}
+          {authError&&<div className="toast" style={{margin:"8px 18px 0",background:"rgba(230,57,70,.15)",border:"1px solid rgba(230,57,70,.35)",borderRadius:12,padding:"9px 14px",color:"#ff6b75",fontSize:12}}>⚠ {authError}</div>}
+          {apiError &&<div className="toast" style={{margin:"8px 18px 0",background:"rgba(244,162,97,.12)",border:"1px solid rgba(244,162,97,.3)",borderRadius:12,padding:"9px 14px",color:"#f4a261",fontSize:12}}>⚠ {apiError}</div>}
+          {/* FIX #8: rate-limit countdown toast */}
+          {/* FIX #10(v9): fixed overlay on detail screens so it never pushes album art down */}
+          {rateLimitSecs>0&&<div className="toast" style={{
+            ...(DETAIL_SCREENS.has(screen)?{position:"fixed",bottom:84,left:18,right:18,zIndex:300,margin:0}:{margin:"8px 18px 0"}),
+            background:"rgba(155,99,255,.12)",border:"1px solid rgba(155,99,255,.3)",borderRadius:12,padding:"9px 14px",color:"#a78bfa",fontSize:12
+          }}>⏱ Too many requests — please wait {rateLimitSecs}s</div>}
+          {}
+          {!isDemo&&token&&isRefreshing&&<div className="toast" style={{margin:"8px 18px 0",background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:"9px 14px",display:"flex",alignItems:"center",gap:8,color:"rgba(255,255,255,.5)",fontSize:12}}><I.Spinner sz={13}/> Reconnecting to Spotify…</div>}
+          {isDemo&&!authError&&!isRefreshing&&<div style={{margin:"8px 18px 0",background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.07)",borderRadius:12,padding:"9px 14px",display:"flex",alignItems:"center",gap:10}}>
+            <div style={{width:7,height:7,borderRadius:4,background:"#f4a261",animation:"shimmer 2s infinite"}}/>
+            <div style={{flex:1}}><div style={{color:"rgba(255,255,255,.65)",fontSize:12,fontWeight:600}}>Demo Mode</div><div style={{color:"rgba(255,255,255,.3)",fontSize:11}}>Connect Spotify for real playback</div></div>
+            <Btn onClick={startLogin} label="Connect Spotify" style={{background:"#1db954",color:"#000",fontSize:11,fontWeight:700,padding:"5px 12px",borderRadius:20}}>Connect</Btn>
+          </div>}
+          {!isDemo&&user&&!isRefreshing&&<div style={{margin:"8px 18px 0",background:"rgba(29,185,84,.07)",border:"1px solid rgba(29,185,84,.18)",borderRadius:12,padding:"9px 14px",display:"flex",alignItems:"center",gap:8}}>
+            <div style={{width:7,height:7,borderRadius:4,background:"#1db954"}}/>
+            <span style={{color:"rgba(255,255,255,.5)",fontSize:12,flex:1}}>Connected as <strong style={{color:"#fff"}}>{user.display_name}</strong></span>
+            {deviceId&&<span style={{color:"#1db954",fontSize:10,fontWeight:600}}>● SDK ready</span>}
+            {/* FIX #4(v11): retry data load if it failed */}
+            {loadStateRef.current==="idle"&&!isLoading&&<Btn onClick={()=>{loadStateRef.current="idle";loadFnRef.current?.();}} label="Retry loading" style={{color:"rgba(29,185,84,.7)",fontSize:10,fontWeight:600,marginLeft:2}}>↺</Btn>}
+            <Btn onClick={handleDisconnect} label="Disconnect" style={{color:"rgba(255,255,255,.25)",fontSize:11,marginLeft:4}}>Disconnect</Btn>
+          </div>}
+
+          {/* HOME */}
+          {screen==="home"&&<div className="screen" style={{padding:"12px 0 110px"}}>
+            <div style={{padding:"0 22px 18px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div><div style={{color:"rgba(255,255,255,.38)",fontSize:13}}>Good evening</div><div style={{color:"#fff",fontSize:26,fontWeight:800,letterSpacing:"-0.5px"}}>Discover</div></div>
+              <div style={{width:40,height:40,borderRadius:20,background:`linear-gradient(135deg,${accent},${accent}88)`,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:800,fontSize:14}}>{user?user.display_name[0].toUpperCase():"JD"}</div>
+            </div>
+            <div style={{padding:"0 22px 22px"}}>
+              {isLoading?<Sk w="100%" h={190} r={22}/>:<Btn onClick={()=>handlePlayTrack(topTracks[0])} label={`Play ${tN(topTracks[0])}`} className="ch" style={{borderRadius:22,overflow:"hidden",position:"relative",height:190,display:"block",transition:"transform .2s"}}>
+                <img src={tC(topTracks[0])} alt="" style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"cover"}}/>
+                <div style={{position:"absolute",inset:0,background:"linear-gradient(135deg,rgba(0,0,0,.82) 0%,rgba(0,0,0,.1) 100%)"}}/>
+                <div style={{position:"absolute",inset:0,background:`linear-gradient(to right,${tAc(topTracks[0])}55 0%,transparent 60%)`}}/>
+                <div style={{position:"relative",padding:20}}>
+                  <div style={{background:tAc(topTracks[0]),color:"#fff",fontSize:10,fontWeight:700,padding:"3px 10px",borderRadius:20,display:"inline-block",marginBottom:8,letterSpacing:1}}>TOP PICK</div>
+                  <div style={{color:"#fff",fontSize:24,fontWeight:800,lineHeight:1.1}}>{tN(topTracks[0])}</div>
+                  <div style={{color:"rgba(255,255,255,.5)",fontSize:13,marginTop:4}}>{tA(topTracks[0])}</div>
+                  <div style={{marginTop:14,width:42,height:42,borderRadius:21,background:"#fff",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                    <svg viewBox="0 0 24 24" fill={tAc(topTracks[0])} style={{width:18,height:18,marginLeft:3}}><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  </div>
+                </div>
+              </Btn>}
+            </div>
+            <div style={{padding:"0 22px 12px",display:"flex",justifyContent:"space-between"}}><div style={{color:"#fff",fontSize:17,fontWeight:700}}>Trending</div><div style={{color:accent,fontSize:13,fontWeight:600}}>See all</div></div>
+            <div style={{display:"flex",gap:13,overflowX:"auto",padding:"0 22px 22px",scrollbarWidth:"none"}}>
+              {isLoading?[1,2,3,4].map(i=><div key={i} style={{flexShrink:0}}><Sk w={118} h={118} r={14}/><div style={{height:6}}/><Sk w={100} h={12}/><div style={{height:4}}/><Sk w={70} h={10}/></div>):
+                recentTracks.map(t=><Btn key={t.id} onClick={()=>handlePlayTrack(t)} label={`Play ${tN(t)}`} className="ch" style={{flexShrink:0,transition:"transform .2s"}}>
+                  <div style={{width:118,height:118,borderRadius:14,overflow:"hidden",marginBottom:8,position:"relative"}}>
+                    <img src={tC(t)} alt="" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+                    {currentTrack.id===t.id&&isPlaying&&<div style={{position:"absolute",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{display:"flex",gap:3,alignItems:"flex-end",height:22}}>{[1,2,3].map(i=><div key={i} className={`b${i}`} style={{width:3,height:15,background:accent,borderRadius:2,transformOrigin:"bottom"}}/>)}</div></div>}
+                  </div>
+                  <div style={{color:"#fff",fontSize:12,fontWeight:600,width:118,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tN(t)}</div>
+                  <div style={{color:"rgba(255,255,255,.38)",fontSize:11,marginTop:2}}>{tA(t)}</div>
+                </Btn>)
+              }
+            </div>
+            <div style={{padding:"0 22px 12px",display:"flex",justifyContent:"space-between"}}><div style={{color:"#fff",fontSize:17,fontWeight:700}}>Your Playlists</div><div style={{color:accent,fontSize:13,fontWeight:600}}>See all</div></div>
+            <div style={{padding:"0 22px",display:"flex",flexDirection:"column",gap:9}}>
+              {isLoading?[1,2,3].map(i=><div key={i} style={{display:"flex",alignItems:"center",gap:13,padding:"9px 12px"}}><Sk w={50} h={50} r={10}/><div><Sk w={120} h={13} r={6}/><div style={{height:5}}/><Sk w={70} h={10} r={5}/></div></div>):
+                playlists.slice(0,4).map(p=><Btn key={p.id} onClick={()=>setScreen("library")} label={p.name} className="tr" style={{display:"flex",alignItems:"center",gap:13,padding:"9px 12px",borderRadius:14,transition:"background .15s"}}>
+                  <img src={p.images?.[0]?.url||"https://picsum.photos/seed/pl/300/300"} alt="" style={{width:50,height:50,borderRadius:10,objectFit:"cover"}}/>
+                  <div style={{flex:1}}><div style={{color:"#fff",fontSize:14,fontWeight:600}}>{p.name}</div><div style={{color:"rgba(255,255,255,.35)",fontSize:12,marginTop:2}}>{p.tracks?.total||"–"} songs</div></div>
+                  <div style={{color:"rgba(255,255,255,.2)"}}><I.ChevR/></div>
+                </Btn>)
+              }
+            </div>
+          </div>}
+
+          {/* SEARCH */}
+          {screen==="search"&&<div className="screen" style={{padding:"12px 0 110px"}}>
+            <div style={{padding:"0 22px 18px"}}>
+              <div style={{color:"#fff",fontSize:26,fontWeight:800,letterSpacing:"-0.5px",marginBottom:14}}>Search</div>
+              <label htmlFor="sp-search" style={{position:"absolute",width:1,height:1,overflow:"hidden",clip:"rect(0,0,0,0)",whiteSpace:"nowrap"}}>Search songs, artists or albums</label>
+              <div style={{display:"flex",alignItems:"center",gap:10,background:"rgba(255,255,255,.07)",borderRadius:14,padding:"12px 16px",border:"1px solid rgba(255,255,255,.07)"}}>
+                <div style={{color:"rgba(255,255,255,.3)"}}><I.Search/></div>
+                <input id="sp-search" value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} placeholder="Songs, artists, albums…" aria-label="Search songs, artists or albums" style={{background:"none",border:"none",color:"#fff",fontSize:15,flex:1,fontFamily:"inherit"}}/>
+                {isSearching&&<I.Spinner sz={16} color={accent}/>}
+                {searchQuery&&!isSearching&&<Btn onClick={()=>setSearchQuery("")} label="Clear" style={{color:"rgba(255,255,255,.3)",fontSize:20,lineHeight:1}}>×</Btn>}
+              </div>
+            </div>
+            {searchQuery?<div style={{padding:"0 22px"}}>
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:11,fontWeight:700,letterSpacing:1,marginBottom:12}}>{isSearching?"SEARCHING…":`RESULTS — ${searchRes.length}`}</div>
+              {!isSearching&&searchRes.length===0?<div style={{color:"rgba(255,255,255,.22)",textAlign:"center",marginTop:48,fontSize:15}}>Nothing found 🔍</div>:
+                searchRes.map(t=><Btn key={t.id} onClick={()=>handlePlayTrack(t)} label={`Play ${tN(t)}`} className="tr" style={{display:"flex",alignItems:"center",gap:13,padding:"9px 12px",borderRadius:14,marginBottom:3,transition:"background .15s"}}>
+                  <div style={{position:"relative"}}><img src={tC(t)} alt="" style={{width:48,height:48,borderRadius:10,objectFit:"cover"}}/>{currentTrack.id===t.id&&<div style={{position:"absolute",inset:0,background:"rgba(0,0,0,.5)",borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{display:"flex",gap:2,alignItems:"flex-end",height:14}}>{[1,2,3].map(i=><div key={i} className={`b${i}`} style={{width:2,height:10,background:accent,borderRadius:2,transformOrigin:"bottom"}}/>)}</div></div>}</div>
+                  <div style={{flex:1,minWidth:0}}><div style={{color:currentTrack.id===t.id?accent:"#fff",fontSize:14,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tN(t)}</div><div style={{color:"rgba(255,255,255,.38)",fontSize:12,marginTop:2}}>{tA(t)} · {fms(tD(t))}</div></div>
+                  <Btn onClick={e=>toggleLike(t.id,e)} label={liked[t.id]?"Unlike":"Like"} style={{color:liked[t.id]?"#e63946":"rgba(255,255,255,.22)",padding:4}}><I.Heart f={liked[t.id]}/></Btn>
+                </Btn>)
+              }
+            </div>:<div style={{padding:"0 22px"}}>
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:11,fontWeight:700,letterSpacing:1,marginBottom:14}}>GENRES</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
+                {GENRES.map(g=><Btn key={g.name} label={`Browse ${g.name}`} style={{height:78,borderRadius:14,background:g.color,overflow:"hidden",position:"relative"}}><div style={{position:"absolute",inset:0,background:"rgba(0,0,0,.18)"}}/><div style={{position:"relative",padding:14}}><div style={{color:"#fff",fontSize:15,fontWeight:700}}>{g.name}</div></div></Btn>)}
+              </div>
+            </div>}
+          </div>}
+
+          {/* LIBRARY */}
+          {screen==="library"&&<div className="screen" style={{padding:"12px 0 110px"}}>
+            <div style={{padding:"0 22px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{color:"#fff",fontSize:26,fontWeight:800,letterSpacing:"-0.5px"}}>Library</div>
+              <Btn label="New playlist" style={{width:36,height:36,borderRadius:18,background:"rgba(255,255,255,.07)",display:"flex",alignItems:"center",justifyContent:"center"}}><I.Plus/></Btn>
+            </div>
+            <div style={{display:"flex",gap:8,padding:"0 22px 18px",overflowX:"auto",scrollbarWidth:"none"}}>
+              {["All","Playlists","Albums","Artists"].map((f,i)=><Btn key={f} label={`Filter ${f}`} style={{padding:"7px 16px",borderRadius:20,flexShrink:0,fontSize:13,fontWeight:600,background:i===0?accent:"rgba(255,255,255,.08)",color:i===0?"#fff":"rgba(255,255,255,.5)"}}>{f}</Btn>)}
+            </div>
+            <div style={{padding:"0 22px"}}>
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:11,fontWeight:700,letterSpacing:1,marginBottom:12}}>PLAYLISTS</div>
+              {playlists.map(p=><Btn key={p.id} label={p.name} className="tr" style={{display:"flex",alignItems:"center",gap:13,padding:"9px 12px",borderRadius:14,marginBottom:3,transition:"background .15s"}}>
+                <img src={p.images?.[0]?.url||"https://picsum.photos/seed/pl/300/300"} alt="" style={{width:50,height:50,borderRadius:10,objectFit:"cover"}}/>
+                <div style={{flex:1}}><div style={{color:"#fff",fontSize:14,fontWeight:600}}>{p.name}</div><div style={{color:"rgba(255,255,255,.35)",fontSize:12,marginTop:2}}>Playlist · {p.tracks?.total||"–"} songs</div></div>
+                <div style={{color:"rgba(255,255,255,.18)"}}><I.ChevR/></div>
+              </Btn>)}
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:11,fontWeight:700,letterSpacing:1,margin:"20px 0 12px"}}>LIKED SONGS</div>
+              {(isDemo?DEMO.filter(t=>liked[t.id]):likedTracks).length===0
+                ?<div style={{color:"rgba(255,255,255,.2)",fontSize:14,textAlign:"center",padding:"20px 0"}}>Tap ♥ on any track to save it</div>
+                :(isDemo?DEMO.filter(t=>liked[t.id]):likedTracks).map(t=><Btn key={t.id} onClick={()=>handlePlayTrack(t)} label={`Play ${tN(t)}`} className="tr" style={{display:"flex",alignItems:"center",gap:13,padding:"9px 12px",borderRadius:14,marginBottom:3,transition:"background .15s"}}>
+                  <img src={tC(t)} alt="" style={{width:48,height:48,borderRadius:10,objectFit:"cover"}}/>
+                  <div style={{flex:1,minWidth:0}}><div style={{color:"#fff",fontSize:14,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tN(t)}</div><div style={{color:"rgba(255,255,255,.38)",fontSize:12,marginTop:2}}>{tA(t)}</div></div>
+                  <div style={{color:"#e63946"}}><I.Heart f/></div>
+                </Btn>)
+              }
+            </div>
+          </div>}
+
+          {/* PLAYER */}
+          {screen==="player"&&<div className="screen" style={{padding:"8px 0 110px"}}>
+            <div style={{padding:"0 22px 20px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <Btn onClick={goBack} label="Back" style={{color:"rgba(255,255,255,.5)",padding:4}}><I.ChevL/></Btn>
+              <div style={{textAlign:"center"}}><div style={{color:"rgba(255,255,255,.35)",fontSize:10,fontWeight:700,letterSpacing:1.5}}>NOW PLAYING</div><div style={{color:"#fff",fontSize:13,fontWeight:600,marginTop:2}}>{tAl(currentTrack)}</div></div>
+              <Btn label="Options" style={{color:"rgba(255,255,255,.5)",padding:4}}><I.Dots/></Btn>
+            </div>
+            <div style={{padding:"0 30px 28px",display:"flex",justifyContent:"center"}}>
+              <div style={{width:308,height:308,borderRadius:26,overflow:"hidden",boxShadow:`0 24px 64px ${accent}55,0 0 0 1px rgba(255,255,255,.05)`}}>
+                <img src={cover} alt={tN(currentTrack)} style={{width:"100%",height:"100%",objectFit:"cover",animation:(isPlaying&&playbackConfirmed)?"spin 30s linear infinite":"none"}}/>
+              </div>
+            </div>
+            <div style={{padding:"0 30px 20px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+              <div style={{flex:1,minWidth:0,marginRight:12}}><div style={{color:"#fff",fontSize:22,fontWeight:800,letterSpacing:"-0.5px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tN(currentTrack)}</div><div style={{color:"rgba(255,255,255,.42)",fontSize:15,marginTop:3}}>{tA(currentTrack)}</div></div>
+              <Btn onClick={e=>toggleLike(currentTrack.id,e)} label={liked[currentTrack.id]?"Unlike":"Like"} style={{color:liked[currentTrack.id]?"#e63946":"rgba(255,255,255,.25)",padding:4}}><I.Heart f={liked[currentTrack.id]} sz={22}/></Btn>
+            </div>
+            {/* FIX #1/#2/#3/#9: Slider with corrected thumb, clamped fill, pointer-events */}
+            <div style={{padding:"0 30px 6px"}}>
+              <Slider value={pct} min={0} max={100} label="Seek" valueText={seekValueText}
+                onClick={handleSeek} onKeyDown={handleSeekKey}
+                style={{height:5,background:"rgba(255,255,255,.1)",borderRadius:3}}
+                fillColor={`linear-gradient(to right,${accent},${accent}cc)`}
+                showThumb thumbColor={accent}
+                transition={barTransition}/>
+              <div style={{display:"flex",justifyContent:"space-between",marginTop:8,color:"rgba(255,255,255,.3)",fontSize:12}}><span>{fms(progressMs)}</span><span>{fms(tD(currentTrack))}</span></div>
+            </div>
+            <div style={{padding:"6px 30px 16px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+              <Btn onClick={toggleShuffle} label="Shuffle" className="cb" style={{color:shuffle?accent:"rgba(255,255,255,.35)",transition:"transform .15s"}}><I.Shuffle/></Btn>
+              <Btn onClick={handlePrev} label="Previous" className="cb" style={{color:skipDirection==="prev"?"rgba(255,255,255,.3)":"rgba(255,255,255,.7)",transition:"all .15s",pointerEvents:skipDirection==="prev"?"none":"auto"}}>{skipDirection==="prev"?<I.Spinner sz={22}/>:<I.Prev/>}</Btn>
+              <Btn onClick={togglePlay} label={isPlaying?"Pause":"Play"} style={{width:66,height:66,borderRadius:33,background:`linear-gradient(145deg,${accent},${accent}99)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 8px 28px ${accent}55`}}>{isPlaying?<I.Pause/>:<I.Play/>}</Btn>
+              <Btn onClick={handleNext} label="Next" className="cb" style={{color:skipDirection==="next"?"rgba(255,255,255,.3)":"rgba(255,255,255,.7)",transition:"all .15s",pointerEvents:skipDirection==="next"?"none":"auto"}}>{skipDirection==="next"?<I.Spinner sz={22}/>:<I.Next/>}</Btn>
+              <Btn onClick={toggleRepeat} label="Repeat" className="cb" style={{color:repeat?accent:"rgba(255,255,255,.35)",transition:"transform .15s"}}><I.Repeat/></Btn>
+            </div>
+            <div style={{padding:"0 30px 18px",display:"flex",alignItems:"center",gap:12}}>
+              <div style={{color:"rgba(255,255,255,.3)"}}><I.VolLo/></div>
+              <Slider value={volume} min={0} max={100} label="Volume" valueText={`${volume}%`}
+                onClick={handleVolume} onKeyDown={handleVolumeKey}
+                style={{flex:1,height:3,background:"rgba(255,255,255,.1)",borderRadius:2}}
+                fillColor="rgba(255,255,255,.4)"/>
+              <div style={{color:"rgba(255,255,255,.3)"}}><I.VolHi/></div>
+            </div>
+            <div style={{padding:"0 30px",display:"flex",justifyContent:"space-around"}}>
+              {[{icon:<I.Queue/>,label:"Queue",action:()=>goTo("queue")},{icon:<I.Mic/>,label:"Lyrics",action:()=>goTo("lyrics")},{icon:<I.Share/>,label:"Share",action:()=>{}}].map(({icon,label,action})=>(
+                <Btn key={label} onClick={action} label={label} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:5,padding:"8px 16px",borderRadius:12,background:"rgba(255,255,255,.05)"}}>
+                  <div style={{color:"rgba(255,255,255,.5)"}}>{icon}</div>
+                  <div style={{color:"rgba(255,255,255,.3)",fontSize:10,fontWeight:600}}>{label}</div>
+                </Btn>
+              ))}
+            </div>
+          </div>}
+
+          {/* QUEUE */}
+          {screen==="queue"&&<div className="screen" style={{padding:"8px 0 110px"}}>
+            <div style={{padding:"0 22px 20px",display:"flex",alignItems:"center",gap:14}}>
+              <Btn onClick={goBack} label="Back" style={{color:"rgba(255,255,255,.5)",padding:4}}><I.ChevL/></Btn>
+              <div style={{flex:1}}><div style={{color:"#fff",fontSize:20,fontWeight:800}}>Play Queue</div><div style={{color:"rgba(255,255,255,.35)",fontSize:12,marginTop:2}}>{queue.length} upcoming</div></div>
+            </div>
+            {queueNote&&<div className="toast" style={{margin:"0 22px 14px",background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:10,padding:"8px 14px",color:"rgba(255,255,255,.45)",fontSize:12}}>ℹ Removed locally — Spotify has no queue-deletion API.</div>}
+            <div style={{padding:"0 22px 16px"}}>
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:11,fontWeight:700,letterSpacing:1,marginBottom:12}}>NOW PLAYING</div>
+              <div style={{display:"flex",alignItems:"center",gap:13,padding:"10px 14px",borderRadius:16,background:`${accent}18`,border:`1px solid ${accent}33`}}>
+                <img src={cover} alt="" style={{width:52,height:52,borderRadius:12,objectFit:"cover",boxShadow:`0 4px 14px ${accent}44`}}/>
+                <div style={{flex:1,minWidth:0}}><div style={{color:accent,fontSize:14,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tN(currentTrack)}</div><div style={{color:"rgba(255,255,255,.42)",fontSize:12,marginTop:2}}>{tA(currentTrack)}</div></div>
+                <div style={{display:"flex",gap:3,alignItems:"flex-end",height:20}}>{isPlaying?[1,2,3].map(i=><div key={i} className={`b${i}`} style={{width:3,height:14,background:accent,borderRadius:2,transformOrigin:"bottom"}}/>):<I.Pause sz={16}/>}</div>
+              </div>
+            </div>
+            <div style={{padding:"0 22px"}}>
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:11,fontWeight:700,letterSpacing:1,marginBottom:12}}>UP NEXT</div>
+              {queue.length===0?<div style={{color:"rgba(255,255,255,.2)",textAlign:"center",padding:"30px 0",fontSize:14}}>Queue is empty</div>:
+                queue.map((t,i)=>(
+                  <div key={`${t.id}-${i}`} className="tr" style={{display:"flex",alignItems:"center",gap:12,padding:"9px 10px",borderRadius:14,marginBottom:3,transition:"background .15s"}}>
+                    <div style={{color:"rgba(255,255,255,.2)",fontSize:13,fontWeight:600,width:18,textAlign:"center",flexShrink:0}}>{i+1}</div>
+                    {/* FIX #6: keyboard-accessible play row */}
+                    <div role="button" tabIndex={0} aria-label={`Play ${tN(t)}`}
+                      onClick={()=>handlePlayTrack(t)}
+                      onKeyDown={e=>(e.key==="Enter"||e.key===" ")&&handlePlayTrack(t)}
+                      style={{display:"flex",alignItems:"center",gap:12,flex:1,minWidth:0,cursor:"pointer"}}>
+                      <img src={tC(t)} alt={tN(t)} style={{width:44,height:44,borderRadius:10,objectFit:"cover",flexShrink:0}}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{color:"#fff",fontSize:13,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tN(t)}</div>
+                        <div style={{color:"rgba(255,255,255,.35)",fontSize:11,marginTop:2}}>{tA(t)} · {fms(tD(t))}</div>
+                      </div>
+                    </div>
+                    <Btn onClick={()=>removeFromQueue(i)} label="Remove" style={{color:"rgba(255,255,255,.22)",padding:"4px 8px",fontSize:18,lineHeight:1,flexShrink:0}}>×</Btn>
+                  </div>
+                ))
+              }
+            </div>
+          </div>}
+
+          {/* LYRICS */}
+          {screen==="lyrics"&&<div className="screen" style={{padding:"8px 0 110px"}}>
+            <div style={{padding:"0 22px 18px",display:"flex",alignItems:"center",gap:14}}>
+              <Btn onClick={goBack} label="Back" style={{color:"rgba(255,255,255,.5)",padding:4}}><I.ChevL/></Btn>
+              <div style={{flex:1}}><div style={{color:"#fff",fontSize:20,fontWeight:800}}>Lyrics</div><div style={{color:"rgba(255,255,255,.35)",fontSize:12,marginTop:2}}>{tN(currentTrack)} · {tA(currentTrack)}</div></div>
+              <div style={{display:"flex",gap:3,alignItems:"flex-end",height:18}}>{isPlaying&&[1,2,3].map(i=><div key={i} className={`b${i}`} style={{width:3,height:13,background:accent,borderRadius:2,transformOrigin:"bottom"}}/>)}</div>
+            </div>
+            <div style={{margin:"0 22px 22px",display:"flex",alignItems:"center",gap:12,padding:"10px 14px",borderRadius:14,background:"rgba(255,255,255,.05)"}}>
+              <img src={cover} alt="" style={{width:40,height:40,borderRadius:10,objectFit:"cover",animation:isPlaying?"spin 30s linear infinite":"none"}}/>
+              <div style={{flex:1}}>
+                <div ref={scrubberRef} onClick={handleScrubberSeek} style={{height:3,background:"rgba(255,255,255,.1)",borderRadius:2,cursor:"pointer"}}>
+                  <div style={{width:`${pct}%`,height:"100%",background:accent,borderRadius:2,transition:barTransition,pointerEvents:"none"}}/>
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",marginTop:5,color:"rgba(255,255,255,.28)",fontSize:10}}><span>{fms(progressMs)}</span><span>{fms(tD(currentTrack))}</span></div>
+              </div>
+              <Btn onClick={togglePlay} label={isPlaying?"Pause":"Play"} style={{color:"rgba(255,255,255,.65)"}}>{isPlaying?<I.Pause sz={20}/>:<I.Play sz={20}/>}</Btn>
+            </div>
+            <div ref={lyricsRef} style={{padding:"0 28px",display:"flex",flexDirection:"column",gap:20}}>
+              {LYRICS.map((line,i)=>(
+                <div key={i} role="button" tabIndex={0} aria-label={`Jump to: ${line.text}`}
+                  className={`lyric${i===lyricIdx?" lyric-on":""}`}
+                  onClick={()=>handleLyricSeek(line)}
+                  onKeyDown={e=>(e.key==="Enter"||e.key===" ")&&handleLyricSeek(line)}
+                  style={{color:i<lyricIdx?"rgba(255,255,255,.16)":i===lyricIdx?"#fff":"rgba(255,255,255,.32)",fontSize:i===lyricIdx?21:17,fontWeight:i===lyricIdx?800:500,lineHeight:1.3,textShadow:i===lyricIdx?`0 0 28px ${accent}88`:"none",letterSpacing:i===lyricIdx?"-0.3px":"0"}}>
+                  {line.text}
+                </div>
+              ))}
+              <div style={{height:60}}/>
+            </div>
+          </div>}
+
+        </div>
+
+        {/* Mini player */}
+        {!DETAIL_SCREENS.has(screen)&&<Btn onClick={()=>goTo("player")} label="Open player" style={{position:"absolute",bottom:70,left:14,right:14,background:`linear-gradient(135deg,${accent}ee,${accent}99)`,backdropFilter:"blur(20px)",borderRadius:18,padding:"10px 14px",display:"flex",alignItems:"center",gap:12,boxShadow:`0 8px 36px ${accent}44`,zIndex:100}}>
+          <img src={cover} alt="" style={{width:42,height:42,borderRadius:11,objectFit:"cover",animation:isPlaying?"spin 30s linear infinite":"none"}}/>
+          <div style={{flex:1,minWidth:0}}><div style={{color:"#fff",fontSize:13,fontWeight:700,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{tN(currentTrack)}</div><div style={{color:"rgba(255,255,255,.6)",fontSize:11,marginTop:1}}>{tA(currentTrack)}</div></div>
+          <Btn onClick={e=>{e.stopPropagation();togglePlay();}} label={isPlaying?"Pause":"Play"} style={{color:"#fff",padding:4}}>{isPlaying?<I.Pause sz={22}/>:<I.Play sz={22}/>}</Btn>
+          <Btn onClick={e=>{e.stopPropagation();handleNext();}} label="Next" style={{color:"rgba(255,255,255,.7)",padding:4}}><I.Next sz={20}/></Btn>
+        </Btn>}
+
+        {/* Bottom nav */}
+        <div style={{position:"absolute",bottom:0,left:0,right:0,height:70,background:"rgba(10,10,12,.97)",backdropFilter:"blur(24px)",borderTop:"1px solid rgba(255,255,255,.05)",display:"flex",alignItems:"center",justifyContent:"space-around",paddingBottom:6,zIndex:200}}>
+          {[{id:"home",icon:<I.Home/>,label:"Home"},{id:"search",icon:<I.Search sz={22}/>,label:"Search"},{id:"library",icon:<I.Library/>,label:"Library"}].map(n=>(
+            <Btn key={n.id} onClick={()=>setScreen(n.id)} label={n.label} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,color:screen===n.id?accent:"rgba(255,255,255,.28)",transition:"color .2s",padding:"4px 22px"}}>
+              {n.icon}
+              <span style={{fontSize:10,fontWeight:600,letterSpacing:.3}}>{n.label}</span>
+            </Btn>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
