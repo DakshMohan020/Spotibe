@@ -2,11 +2,46 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Spotibe</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #060608; }
+    #loading {
+      position: fixed; inset: 0; background: #060608;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      color: #1db954; font-family: sans-serif; font-size: 18px; gap: 16px;
+    }
+    .spinner {
+      width: 40px; height: 40px; border: 3px solid #1db95433;
+      border-top-color: #1db954; border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
 </head>
-<body style="margin:0;padding:0;background:#060608;">
-  <div id="root"></div>
+<body>
+  <div id="loading">
+    <div class="spinner"></div>
+    <span>Loading Spotibe...</span>
+  </div>
+  <div id="root" style="display:none"></div>
+
+  <script>
+    // Preserve the OAuth code BEFORE anything else loads
+    // This runs synchronously before Babel or React
+    (function() {
+      var params = new URLSearchParams(window.location.search);
+      var code = params.get('code');
+      var state = params.get('state');
+      if (code) {
+        sessionStorage.setItem('_oauth_code', code);
+        // Clean the URL immediately
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+    })();
+  </script>
 
   <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
@@ -14,7 +49,6 @@
 
   <script type="text/babel" data-type="module">
     const { useState, useEffect, useRef, useCallback } = React;
-
 
 // ─────────────────────────────────────────────────────────────────
 // Spotibe — Spotify-connected mobile music player
@@ -1021,6 +1055,19 @@ function SpotibeApp() {
   );
 }
 
+
+    // Patch: restore OAuth code from our safe storage if present
+    const _savedCode = sessionStorage.getItem('_oauth_code');
+    if (_savedCode) {
+      sessionStorage.removeItem('_oauth_code');
+      // Inject into URL search so the app's useEffect picks it up
+      const _url = new URL(window.location.href);
+      _url.searchParams.set('code', _savedCode);
+      window.history.replaceState({}, '', _url.toString());
+    }
+
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('root').style.display = '';
 
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(<SpotibeApp />);
